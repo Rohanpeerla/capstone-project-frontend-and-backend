@@ -1,0 +1,14 @@
+# Helmet Detection and Number Plate Recognition System
+# Install: pip install -r requirements.txt
+
+# Web Framework
+flask>=2.0.0
+
+# Computer Vision and Object Detection
+ultralytics>=8.0.0
+opencv-python>=4.5.0
+easyocr>=1.6.0
+
+# Additional utilities (auto-installed with above)
+# numpy, pillow, torch (via ultralytics)
+
