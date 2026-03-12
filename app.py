@@ -42,10 +42,15 @@ ENABLE_WEBCAM_PLATE_OCR = os.environ.get("ENABLE_WEBCAM_PLATE_OCR", "0") == "1"
 ENABLE_IMAGE_FULL_FRAME_FALLBACK = os.environ.get("ENABLE_IMAGE_FULL_FRAME_FALLBACK", "0") == "1"
 MAX_PLATE_REGION_PROPOSALS = max(1, int(os.environ.get("MAX_PLATE_REGION_PROPOSALS", "3")))
 IMAGE_CACHE_SIZE = max(1, int(os.environ.get("IMAGE_CACHE_SIZE", "32")))
+HELMET_CONFIDENCE_THRESHOLD = float(os.environ.get("HELMET_CONFIDENCE_THRESHOLD", "62"))
+DIRECT_HELMET_CONFIDENCE_THRESHOLD = float(os.environ.get("DIRECT_HELMET_CONFIDENCE_THRESHOLD", "85"))
+DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD = float(os.environ.get("DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD", "60"))
+IMAGE_RESULT_VERSION = "helmet-v8"
 helmet_model = None
 plate_model = None
 ocr_reader = None
 helmet_support_cache = None
+face_cascade = None
 image_result_cache = {}
 
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
@@ -56,6 +61,7 @@ os.makedirs(RESULT_FOLDER, exist_ok=True)
 
 VEHICLE_CLASSES = {"car", "motorcycle", "bus", "truck"}
 HELMET_CLASS_NAMES = {"helmet", "helmets", "with helmet", "with_helmet", "helmet_present"}
+NO_HELMET_CLASS_NAMES = {"no helmet", "no_helmet", "without helmet", "without_helmet", "helmetless"}
 PLATE_CLASS_NAMES = {"number plate", "number plates", "license plate", "licence plate", "plate"}
 PLATE_PATTERNS = [
     re.compile(r"^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$"),
@@ -149,6 +155,18 @@ def get_ocr_reader():
     return ocr_reader
 
 
+def get_face_cascade():
+    global face_cascade
+    if face_cascade is None:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if os.path.exists(cascade_path):
+            classifier = cv2.CascadeClassifier(cascade_path)
+            face_cascade = classifier if not classifier.empty() else False
+        else:
+            face_cascade = False
+    return face_cascade if face_cascade is not False else None
+
+
 def warm_up_runtime():
     get_helmet_model()
     get_plate_model()
@@ -188,12 +206,95 @@ def helmet_detection_supported():
     global helmet_support_cache
     if helmet_support_cache is None:
         model = get_helmet_model()
-        helmet_support_cache = any(name in HELMET_CLASS_NAMES for name in model.names.values())
+        helmet_support_cache = any(
+            str(name).strip().lower() in HELMET_CLASS_NAMES
+            for name in model.names.values()
+        )
     return helmet_support_cache
 
 
 def is_helmet_class(class_name):
-    return class_name in HELMET_CLASS_NAMES
+    return str(class_name).strip().lower() in HELMET_CLASS_NAMES
+
+
+def is_no_helmet_class(class_name):
+    return str(class_name).strip().lower() in NO_HELMET_CLASS_NAMES
+
+
+def assess_head_coverage(person_crop):
+    if person_crop is None or person_crop.size == 0:
+        return {
+            "face_visible": False,
+            "shell_like": False,
+            "top_dark_ratio": 0.0,
+            "side_dark_ratio": 0.0,
+            "skin_ratio": 1.0,
+        }
+
+    height, width = person_crop.shape[:2]
+    if height < 60 or width < 40:
+        return {
+            "face_visible": False,
+            "shell_like": False,
+            "top_dark_ratio": 0.0,
+            "side_dark_ratio": 0.0,
+            "skin_ratio": 1.0,
+        }
+
+    head_region_height = max(1, int(height * 0.42))
+    head_region = person_crop[:head_region_height, :]
+    gray = cv2.cvtColor(head_region, cv2.COLOR_BGR2GRAY)
+    h, w = head_region.shape[:2]
+    center_x_start = max(0, int(w * 0.15))
+    center_x_end = min(w, int(w * 0.85))
+
+    hsv = cv2.cvtColor(head_region, cv2.COLOR_BGR2HSV)
+    lower_skin = np.array([0, 25, 60], dtype=np.uint8)
+    upper_skin = np.array([30, 180, 255], dtype=np.uint8)
+    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+    skin_ratio = cv2.countNonZero(skin_mask) / skin_mask.size if skin_mask.size > 0 else 1.0
+
+    left_band = gray[:, :max(1, int(w * 0.18))]
+    right_band = gray[:, min(w - 1, int(w * 0.82)):] if w > 1 else gray
+    top_band = gray[:max(1, int(h * 0.25)), :]
+    side_dark = cv2.countNonZero(cv2.threshold(left_band, 135, 255, cv2.THRESH_BINARY_INV)[1])
+    side_dark += cv2.countNonZero(cv2.threshold(right_band, 135, 255, cv2.THRESH_BINARY_INV)[1])
+    side_area = max(1, left_band.size + right_band.size)
+    side_dark_ratio = side_dark / side_area
+    top_dark = cv2.countNonZero(cv2.threshold(top_band, 145, 255, cv2.THRESH_BINARY_INV)[1])
+    top_dark_ratio = top_dark / top_band.size if top_band.size > 0 else 0.0
+
+    face_visible = False
+    face_detector = get_face_cascade()
+    if face_detector is not None:
+        faces = face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(24, 24)
+        )
+        head_area = float(max(1, h * w))
+        for fx, fy, fw, fh in faces:
+            face_area_ratio = (fw * fh) / head_area
+            face_center_x = fx + (fw / 2.0)
+            lower_face_visible = (fy + fh) > (h * 0.55)
+            if face_area_ratio >= 0.08 and center_x_start <= face_center_x <= center_x_end and lower_face_visible:
+                face_visible = True
+                break
+
+    shell_like = (
+        top_dark_ratio > 0.19 or
+        side_dark_ratio > 0.22 or
+        skin_ratio < 0.30
+    )
+
+    return {
+        "face_visible": face_visible,
+        "shell_like": shell_like,
+        "top_dark_ratio": top_dark_ratio,
+        "side_dark_ratio": side_dark_ratio,
+        "skin_ratio": skin_ratio,
+    }
 
 
 def detect_helmet_in_person_crop(person_crop):
@@ -207,10 +308,14 @@ def detect_helmet_in_person_crop(person_crop):
     
     try:
         height = person_crop.shape[0]
-        head_region_height = max(1, int(height * 0.30))
+        width = person_crop.shape[1]
+        if height < 80 or width < 40:
+            return False, 0.0
+
+        head_region_height = max(1, int(height * 0.42))
         head_region = person_crop[:head_region_height, :]
         
-        if head_region.size < 100:
+        if head_region.size < 100 or head_region.shape[0] < 20 or head_region.shape[1] < 20:
             return False, 0.0
         
         # Normalize crop size for threshold adjustment
@@ -219,6 +324,25 @@ def detect_helmet_in_person_crop(person_crop):
         is_large_crop = crop_area > 500000  # Greater than ~707x707
         
         gray = cv2.cvtColor(head_region, cv2.COLOR_BGR2GRAY)
+        h, w = head_region.shape[:2]
+        center_x_start = max(0, int(w * 0.15))
+        center_x_end = min(w, int(w * 0.85))
+        face_detector = get_face_cascade()
+        detected_face = None
+        if face_detector is not None:
+            faces = face_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(24, 24)
+            )
+            head_area = float(head_region.shape[0] * head_region.shape[1])
+            for fx, fy, fw, fh in faces:
+                face_area_ratio = (fw * fh) / head_area if head_area > 0 else 0.0
+                face_center_x = fx + (fw / 2.0)
+                if face_area_ratio >= 0.08 and center_x_start <= face_center_x <= center_x_end:
+                    detected_face = (fx, fy, fw, fh, face_area_ratio)
+                    break
         
         # Method 1: Local contrast analysis
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -239,11 +363,24 @@ def detect_helmet_in_person_crop(person_crop):
         _, binary_medium = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
         medium_count = cv2.countNonZero(binary_medium)
         medium_ratio = medium_count / binary_medium.size if binary_medium.size > 0 else 0
+
+        hsv = cv2.cvtColor(head_region, cv2.COLOR_BGR2HSV)
+        lower_skin = np.array([0, 25, 60], dtype=np.uint8)
+        upper_skin = np.array([30, 180, 255], dtype=np.uint8)
+        skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        skin_ratio = cv2.countNonZero(skin_mask) / skin_mask.size if skin_mask.size > 0 else 0
+
+        left_band = gray[:, :max(1, int(w * 0.18))]
+        right_band = gray[:, min(w - 1, int(w * 0.82)):] if w > 1 else gray
+        top_band = gray[:max(1, int(h * 0.25)), :]
+        side_dark = cv2.countNonZero(cv2.threshold(left_band, 135, 255, cv2.THRESH_BINARY_INV)[1])
+        side_dark += cv2.countNonZero(cv2.threshold(right_band, 135, 255, cv2.THRESH_BINARY_INV)[1])
+        side_area = left_band.size + right_band.size if (left_band.size + right_band.size) > 0 else 1
+        side_dark_ratio = side_dark / side_area
+        top_dark = cv2.countNonZero(cv2.threshold(top_band, 145, 255, cv2.THRESH_BINARY_INV)[1])
+        top_dark_ratio = top_dark / top_band.size if top_band.size > 0 else 0
         
         # Method 5: Center region analysis
-        h, w = head_region.shape[:2]
-        center_x_start = max(0, int(w * 0.15))
-        center_x_end = min(w, int(w * 0.85))
         center_region = gray[:, center_x_start:center_x_end]
         center_dark = cv2.countNonZero(
             cv2.threshold(center_region, 120, 255, cv2.THRESH_BINARY_INV)[1]
@@ -265,23 +402,20 @@ def detect_helmet_in_person_crop(person_crop):
         
         # Adaptive thresholds based on crop size - balanced for both detection and false positives
         if is_small_crop:
-            # More lenient for small crops (distant people)
-            threshold_edge = 0.07
-            threshold_dark = 0.20
-            threshold_contrast = 7.0
-            threshold_medium = 0.14
-        elif is_large_crop:
-            # Stricter for very large crops
-            threshold_edge = 0.12
-            threshold_dark = 0.28
-            threshold_contrast = 24
-            threshold_medium = 0.24
-        else:
-            # Standard thresholds for medium crops
-            threshold_edge = 0.10
+            threshold_edge = 0.08
             threshold_dark = 0.24
-            threshold_contrast = 18
-            threshold_medium = 0.19
+            threshold_contrast = 10.0
+            threshold_medium = 0.18
+        elif is_large_crop:
+            threshold_edge = 0.12
+            threshold_dark = 0.30
+            threshold_contrast = 26
+            threshold_medium = 0.26
+        else:
+            threshold_edge = 0.11
+            threshold_dark = 0.27
+            threshold_contrast = 20
+            threshold_medium = 0.22
         
         # Signal voting system with strength scores
         signal_strengths = []
@@ -309,6 +443,12 @@ def detect_helmet_in_person_crop(person_crop):
         # Signal 6: Contours in head region (0-100, max 20 contours = 100%)
         contour_strength = min(100, (helmet_contours / 20) * 100)
         signal_strengths.append(contour_strength)
+        side_strength = min(100, (side_dark_ratio / 0.20) * 100)
+        signal_strengths.append(side_strength)
+        top_strength = min(100, (top_dark_ratio / 0.18) * 100)
+        signal_strengths.append(top_strength)
+        shell_strength = min(100, ((1.0 - skin_ratio) / 0.75) * 100)
+        signal_strengths.append(shell_strength)
         
         # Calculate confidence as average of all signals
         overall_confidence = np.mean(signal_strengths)
@@ -320,16 +460,43 @@ def detect_helmet_in_person_crop(person_crop):
             dark_ratio > threshold_dark,
             medium_ratio > threshold_medium,
             contrast_mean > threshold_contrast,
-            center_dark_ratio > 0.10,
-            helmet_contours > 0
+            center_dark_ratio > 0.14,
+            helmet_contours > 1,
+            side_dark_ratio > 0.18,
+            top_dark_ratio > 0.16,
+            skin_ratio < 0.38,
         ]
         
         signal_count = sum(signals_above_threshold)
-        helmet_detected = signal_count >= 4
+        strong_dark_signal = dark_ratio > threshold_dark and medium_ratio > threshold_medium
+        strong_shape_signal = (
+            center_dark_ratio > 0.14 and
+            helmet_contours > 1 and
+            (side_dark_ratio > 0.18 or top_dark_ratio > 0.16)
+        )
+
+        if detected_face is not None:
+            _, fy, _, fh, face_area_ratio = detected_face
+            lower_face_visible = (fy + fh) > (h * 0.55)
+            shell_like = (
+                top_dark_ratio > 0.16 or
+                side_dark_ratio > 0.18 or
+                (helmet_contours > 1 and medium_ratio > threshold_medium) or
+                skin_ratio < 0.34
+            )
+            if face_area_ratio >= 0.10 and lower_face_visible and not shell_like:
+                return False, 8.0
+
+        helmet_detected = (
+            signal_count >= 5 and
+            strong_dark_signal and
+            strong_shape_signal and
+            skin_ratio < 0.45 and
+            overall_confidence >= HELMET_CONFIDENCE_THRESHOLD
+        )
         
-        # If helmet not detected but confidence is moderate, return lower confidence
         if not helmet_detected:
-            overall_confidence = overall_confidence * 0.5  # Reduce confidence for non-detections
+            overall_confidence = min(overall_confidence * 0.45, HELMET_CONFIDENCE_THRESHOLD - 1)
         
         return helmet_detected, overall_confidence
     except Exception as e:
@@ -483,6 +650,199 @@ def annotate_plate_text(frame, x, y, text):
         2,
         cv2.LINE_AA
     )
+
+
+def format_confidence_label(confidence):
+    return f"{max(0.0, min(100.0, float(confidence))):.1f}%"
+
+
+def draw_labeled_box(frame, x1, y1, x2, y2, label, color, thickness=2):
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        2
+    )
+    text_top = max(text_height + 8, y1 - 8)
+    label_top = max(0, text_top - text_height - baseline - 6)
+    label_bottom = min(frame.shape[0], text_top + baseline - 2)
+    label_right = min(frame.shape[1], x1 + text_width + 10)
+
+    cv2.rectangle(frame, (x1, label_top), (label_right, label_bottom), color, -1)
+    cv2.putText(
+        frame,
+        label,
+        (x1 + 5, text_top),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+
+def passes_direct_helmet_threshold(class_name, confidence):
+    if is_helmet_class(class_name):
+        return confidence >= DIRECT_HELMET_CONFIDENCE_THRESHOLD
+    if is_no_helmet_class(class_name):
+        return confidence >= DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD
+    return True
+
+
+def overlay_model_boxes(frame, detection_result):
+    for box in detection_result.boxes:
+        x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        class_name = detection_result.names[int(box.cls[0])]
+        confidence = float(box.conf[0]) * 100 if box.conf is not None else 0.0
+        if (is_helmet_class(class_name) or is_no_helmet_class(class_name)) and not passes_direct_helmet_threshold(class_name, confidence):
+            continue
+        label = f"{class_name} {format_confidence_label(confidence)}"
+        draw_labeled_box(frame, x1, y1, x2, y2, label, (50, 220, 100))
+
+    return frame
+
+
+def analyze_helmet_detections(frame, detection_result, model_names):
+    classes = [model_names[int(c)] for c in detection_result.boxes.cls]
+    explicit_helmet_support = helmet_detection_supported()
+    helmet_detected = any(is_helmet_class(class_name) for class_name in classes)
+    helmet_count = sum(1 for class_name in classes if is_helmet_class(class_name))
+    helmet_confidence = 95.0 if helmet_detected else 0.0
+    person_annotations = []
+    detected_objects = []
+
+    for box in detection_result.boxes:
+        class_name = model_names[int(box.cls[0])]
+        confidence = float(box.conf[0]) * 100 if box.conf is not None else 0.0
+        detected_objects.append(f"{class_name} ({format_confidence_label(confidence)})")
+
+        if (is_helmet_class(class_name) or is_no_helmet_class(class_name)) and passes_direct_helmet_threshold(class_name, confidence):
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+            if x2 > x1 and y2 > y1:
+                person_crop = frame[y1:y2, x1:x2]
+                head_assessment = assess_head_coverage(person_crop)
+                helmet_label = is_helmet_class(class_name)
+                if helmet_label and head_assessment["face_visible"] and not head_assessment["shell_like"]:
+                    helmet_label = False
+                    confidence = max(confidence, DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD)
+                    detected_objects.append("no helmet override (visible face)")
+                elif (not helmet_label) and head_assessment["shell_like"] and confidence < DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD + 15:
+                    helmet_label = True
+                    confidence = max(confidence, DIRECT_HELMET_CONFIDENCE_THRESHOLD)
+                    detected_objects.append("helmet override (shell coverage)")
+
+                person_annotations.append({
+                    "box": (x1, y1, x2, y2),
+                    "helmet": helmet_label,
+                    "confidence": confidence,
+                })
+
+    if not explicit_helmet_support:
+        return {
+            "helmet_detected": False,
+            "helmet_count": 0,
+            "helmet_confidence": 0.0,
+            "person_annotations": person_annotations,
+            "detected_objects": detected_objects,
+            "helmet_status": "Unknown",
+        }
+
+    if person_annotations:
+        positive_annotations = [annotation for annotation in person_annotations if annotation["helmet"]]
+        negative_annotations = [annotation for annotation in person_annotations if not annotation["helmet"]]
+        direct_confidences = [annotation["confidence"] for annotation in person_annotations]
+        positive_confidence = max((annotation["confidence"] for annotation in positive_annotations), default=0.0)
+        negative_confidence = max((annotation["confidence"] for annotation in negative_annotations), default=0.0)
+        if direct_confidences:
+            helmet_confidence = max(direct_confidences)
+        helmet_status = "Unknown"
+        helmet_detected = False
+        helmet_count = 0
+        if positive_confidence >= DIRECT_HELMET_CONFIDENCE_THRESHOLD and positive_confidence > negative_confidence:
+            helmet_status = "Yes"
+            helmet_detected = True
+            helmet_count = len(positive_annotations)
+            helmet_confidence = positive_confidence
+        elif negative_confidence >= DIRECT_NO_HELMET_CONFIDENCE_THRESHOLD and negative_confidence >= positive_confidence:
+            helmet_status = "No"
+            helmet_detected = False
+            helmet_count = 0
+            helmet_confidence = negative_confidence
+        return {
+            "helmet_detected": helmet_detected,
+            "helmet_count": helmet_count,
+            "helmet_confidence": helmet_confidence,
+            "person_annotations": person_annotations,
+            "detected_objects": detected_objects,
+            "helmet_status": helmet_status,
+        }
+
+    try:
+        person_boxes = [
+            box for box in detection_result.boxes
+            if model_names[int(box.cls[0])] == "person"
+        ]
+
+        for box in person_boxes:
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            person_crop = frame[y1:y2, x1:x2]
+            is_helmet, confidence = detect_helmet_in_person_crop(person_crop)
+            helmet_confidence = max(helmet_confidence, confidence)
+            person_annotations.append({
+                "box": (x1, y1, x2, y2),
+                "helmet": is_helmet,
+                "confidence": confidence,
+            })
+            detected_objects.append(
+                f"{'helmet' if is_helmet else 'no helmet'} ({format_confidence_label(confidence)})"
+            )
+
+            if not helmet_detected and is_helmet:
+                helmet_detected = True
+                helmet_count += 1
+    except Exception as e:
+        print(f"Error checking helmets on persons: {e}")
+
+    return {
+        "helmet_detected": helmet_detected,
+        "helmet_count": helmet_count,
+        "helmet_confidence": helmet_confidence,
+        "person_annotations": person_annotations,
+        "detected_objects": detected_objects,
+        "helmet_status": "Yes" if helmet_detected else "No",
+    }
+
+
+def overlay_person_helmet_annotations(frame, person_annotations):
+    for annotation in person_annotations:
+        x1, y1, x2, y2 = annotation["box"]
+        confidence = annotation["confidence"]
+        if annotation["helmet"]:
+            label = f"Helmet {format_confidence_label(confidence)}"
+            color = (0, 200, 0)
+        else:
+            label = f"No Helmet {format_confidence_label(confidence)}"
+            color = (0, 0, 255)
+        draw_labeled_box(frame, x1, y1, x2, y2, label, color, thickness=3)
+
+    return frame
 
 
 def find_plate_like_regions(image):
@@ -787,7 +1147,7 @@ def detect_image():
     file.save(path)
     cache_key = get_file_hash(path)
     cached_payload = get_cached_image_result(cache_key)
-    if cached_payload is not None:
+    if cached_payload is not None and cached_payload.get("result_version") == IMAGE_RESULT_VERSION:
         return jsonify(cached_payload)
 
     original_frame = load_image_from_path(path)
@@ -796,10 +1156,11 @@ def detect_image():
 
     frame = resize_for_inference(original_frame)
     results = current_model(frame, verbose=False, imgsz=YOLO_IMAGE_SIZE)
+    helmet_analysis = analyze_helmet_detections(frame, results[0], current_model.names)
     result_filename = "result_" + filename
     result_path = os.path.join(RESULT_FOLDER, result_filename)
     # Detect plates using YOLO + minimal OCR (fast)
-    annotated_frame = results[0].plot()
+    annotated_frame = overlay_model_boxes(frame.copy(), results[0])
     plate_numbers = []
     
     custom_plate_model = get_plate_model()
@@ -807,7 +1168,7 @@ def detect_image():
         # Use YOLO plate model for detection
         try:
             plate_results = custom_plate_model(frame, verbose=False, imgsz=YOLO_IMAGE_SIZE)
-            annotated_frame = frame.copy()
+            annotated_frame = overlay_model_boxes(frame.copy(), results[0])
             seen = set()
             
             for box in plate_results[0].boxes:
@@ -852,49 +1213,18 @@ def detect_image():
                         seen_rects.add((x1, y1, x2, y2))
         except Exception as e:
             print(f"Plate detection error: {e}")
-            annotated_frame = results[0].plot()
+            annotated_frame = overlay_model_boxes(frame.copy(), results[0])
     else:
-        annotated_frame = results[0].plot()
+        annotated_frame = overlay_model_boxes(frame.copy(), results[0])
+
+    overlay_person_helmet_annotations(annotated_frame, helmet_analysis["person_annotations"])
 
     cv2.imwrite(result_path, annotated_frame)
 
-    classes = [current_model.names[int(c)] for c in results[0].boxes.cls]
-    
-    # Check for explicit helmet class detection
-    helmet_detected = any(is_helmet_class(class_name) for class_name in classes)
-    helmet_count = sum(1 for class_name in classes if is_helmet_class(class_name))
-    helmet_confidence = 95.0 if helmet_detected else 0.0  # 95% confidence for explicit detection
-    
-    # If no explicit helmet class detected, check for helmets on detected persons
-    if not helmet_detected:
-        try:
-            person_boxes = [
-                box for box in results[0].boxes 
-                if current_model.names[int(box.cls[0])] == "person"
-            ]
-            
-            confidences = []
-            for box in person_boxes:
-                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                
-                if x2 > x1 and y2 > y1:
-                    person_crop = frame[y1:y2, x1:x2]
-                    is_helmet, confidence = detect_helmet_in_person_crop(person_crop)
-                    confidences.append(confidence)
-                    if is_helmet:
-                        helmet_detected = True
-                        helmet_count += 1
-            
-            # Use maximum confidence found
-            if confidences:
-                helmet_confidence = max(confidences)
-        except Exception as e:
-            print(f"Error checking helmets on persons: {e}")
-            helmet_confidence = 0.0
-    
-    helmet_status = "Yes" if helmet_detected else "No"
+    helmet_detected = helmet_analysis["helmet_detected"]
+    helmet_count = helmet_analysis["helmet_count"]
+    helmet_confidence = helmet_analysis["helmet_confidence"]
+    helmet_status = helmet_analysis.get("helmet_status", "Yes" if helmet_detected else "No")
 
     payload = {
         "image_path": url_for("static", filename=f"results/{result_filename}"),
@@ -903,7 +1233,13 @@ def detect_image():
         "helmet_count": helmet_count,
         "helmet_accuracy": round(helmet_confidence, 2),
         "plate_numbers": plate_numbers,
-        "detection_summary": f"Helmet detected: {helmet_status} (Accuracy: {helmet_confidence:.1f}%)",
+        "detected_objects": helmet_analysis["detected_objects"],
+        "result_version": IMAGE_RESULT_VERSION,
+        "detection_summary": (
+            f"Helmet detected: {helmet_status} (Accuracy: {helmet_confidence:.1f}%)"
+            if helmet_status != "Unknown"
+            else "Helmet status: Unknown (dedicated helmet model not available)"
+        ),
         "helmet_detection_supported": helmet_detection_supported()
     }
     set_cached_image_result(cache_key, payload)
