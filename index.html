@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helmet Detection System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <main class="page-shell">
+        <section class="hero">
+            <div class="hero-copy">
+                <span class="eyebrow">Traffic Safety Monitor</span>
+                <h1>Helmet and Number Plate Detection
+                    <br>Using YOLOV8 </h1>
+                <p>Upload traffic photos, analyze recorded videos, or launch the live webcam to detect helmets, identify vehicles, and review annotated results from one place</p>
+                <div class="hero-metrics">
+                    <div class="metric">
+                        <strong>3 Modes</strong>
+                        <span>Image, video and live webcam</span>
+                    </div>
+                    <div class="metric">
+                        <strong>Live Boxes</strong>
+                        <span>Annotated objects and confidence labels</span>
+                    </div>
+                    <div class="metric">
+                        <strong>Plate OCR</strong>
+                        <span>Number plate detection remains intact</span>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-visual">
+                <div class="hero-visual-content">
+                    <span class="eyebrow">System Snapshot</span>
+                    <h2>Fast access to detection workflows</h2>
+                    <p>Choose image mode for detailed review, video mode for uploaded clips, or webcam mode for live checking. Each view keeps the same boxed output and summary structure.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="page-explainer">
+            <div class="explainer-card">
+                <span class="eyebrow">About This Page</span>
+                <h2>About The Web Page and its uses</h2>
+                <p>This page brings image, video, and webcam detection into one interface so traffic safety checks can be done faster. Instead of moving between different tools, you can choose the format you have, run detection, and review the result from the same system.</p>
+                <p>Use image mode for detailed single-photo analysis, video mode for recorded clips, and webcam mode for live monitoring. The goal of this page is to make helmet checking and annotated review easier, clearer, and faster during testing.</p>
+            </div>
+        </section>
+
+        <section class="grid">
+            <div class="card card-image-feature">
+                <h2>Image Detection</h2>
+                <p>Use the largest panel for still-image review, where you can upload rider photos and inspect the boxed output with object details.</p>
+                <div class="quick-links">
+                    <div class="quick-link">
+                        <strong>Best for detailed review</strong>
+                        <span>Ideal for checking a single rider image, reading the annotations clearly, and verifying the helmet decision frame by frame.</span>
+                    </div>
+                </div>
+                <div class="button-row">
+                    <button onclick="openImagePage()">Open Image Page</button>
+                </div>
+            </div>
+
+            <div class="card card-video-medium">
+                <h2>Video Detection</h2>
+                <p>Upload a video to process object boxes, helmet status and number plate characters on the resulting clip.</p>
+                <div class="upload-panel">
+                    <input type="file" id="videoInput" accept="video/*">
+                    <div class="button-row">
+                        <button onclick="detectVideo()">Detect Video</button>
+                    </div>
+                    <div id="videoResult"></div>
+                </div>
+            </div>
+
+            <aside class="card card-webcam-medium">
+                <h2>Webcam Detection</h2>
+                <p>Open the live monitoring page for real-time rider checks with annotated detections.</p>
+                <div class="quick-links">
+                    <div class="quick-link">
+                        <strong>Live stream access</strong>
+                        <span>Use this for continuous monitoring when you want to test the camera feed directly.</span>
+                    </div>
+                </div>
+                <div class="button-row">
+                    <button onclick="openWebcamPage()">Open Webcam Page</button>
+                </div>
+            </aside>
+        </section>
+    </main>
+
+    <script>
+        function resultClass(status) {
+            if (status === "Yes") return "result helmet";
+            if (status === "No") return "result nohelmet";
+            return "result warning";
+        }
+
+        function openImagePage() {
+            window.location.href = "/image_page";
+        }
+
+        async function detectVideo() {
+            const fileInput = document.getElementById("videoInput");
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("Please select a video.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("video", file);
+
+            const response = await fetch("/detect_video", {
+                method: "POST",
+                body: formData
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                document.getElementById("videoResult").innerHTML = `
+                    <div class="result nohelmet">${data.error || "Video detection failed."}</div>
+                `;
+                return;
+            }
+            document.getElementById("videoResult").innerHTML = `
+                <video controls>
+                    <source src="${data.video_path}?t=${Date.now()}" type="video/mp4">
+                </video>
+                <div class="result-grid">
+                    <div class="${resultClass(data.helmet_status)}">
+                        <strong>${data.detection_summary}</strong>
+                    </div>
+                    <div class="info-box">
+                        <strong>Number Plate Characters:</strong> ${renderPlateNumbers(data.plate_numbers)}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPlateNumbers(plateNumbers) {
+            if (!plateNumbers || plateNumbers.length === 0) {
+                return "No plate number found";
+            }
+            return plateNumbers.join(", ");
+        }
+
+        function openWebcamPage() {
+            window.location.href = "/webcam_page";
+        }
+    </script>
+</body>
+</html>

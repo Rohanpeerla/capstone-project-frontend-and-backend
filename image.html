@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Detection</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <main class="page-shell">
+        <header class="page-header">
+            <span class="eyebrow">Image Review</span>
+            <h1>Upload a rider image</h1>
+            <p class="page-intro">Run detection on a still photo and inspect the annotated result, the helmet decision, number plate output, and the object list in one panel.</p>
+        </header>
+
+        <section class="grid">
+            <div class="card card-primary">
+                <h2>Image Detection</h2>
+                <p>Select an image and generate the boxed detection output.</p>
+                <div class="upload-panel">
+                    <input type="file" id="imageInput" accept="image/*">
+                    <div class="button-row">
+                        <button onclick="detectImage()">Check Image</button>
+                        <button onclick="window.location.href='/'">Back</button>
+                    </div>
+                    <div id="imageResult"></div>
+                </div>
+            </div>
+
+            <aside class="card card-secondary">
+                <h2>What You Get</h2>
+                <p>The result panel keeps the layout simple while giving the output more visual weight.</p>
+                <div class="quick-links">
+                    <div class="quick-link">
+                        <strong>Annotated output</strong>
+                        <span>Detected objects are shown directly on the processed image with confidence labels.</span>
+                    </div>
+                    <div class="quick-link">
+                        <strong>Compact details</strong>
+                        <span>Helmet status, object list and plate text are grouped below the image instead of scattered.</span>
+                    </div>
+                </div>
+            </aside>
+        </section>
+    </main>
+
+    <script>
+        function resultClass(status) {
+            if (status === "Yes") return "result helmet";
+            if (status === "No") return "result nohelmet";
+            return "result warning";
+        }
+
+        async function detectImage() {
+            const fileInput = document.getElementById("imageInput");
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("Please choose an image file.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("image", file);
+
+            const response = await fetch("/detect_image", {
+                method: "POST",
+                body: formData
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                document.getElementById("imageResult").innerHTML = `
+                    <div class="result nohelmet">${data.error || "Image detection failed."}</div>
+                `;
+                return;
+            }
+
+            document.getElementById("imageResult").innerHTML = `
+                <img src="${data.image_path}?t=${Date.now()}" alt="Detection result">
+                <div class="result-grid">
+                    <div class="${resultClass(data.helmet_status)}">
+                        <strong>${data.detection_summary}</strong>
+                        ${data.helmet_count ? `<p>Count: ${data.helmet_count}</p>` : ""}
+                    </div>
+                    <div class="info-box">
+                        <strong>Number Plate Characters:</strong> ${renderPlateNumbers(data.plate_numbers)}
+                    </div>
+                    <div class="info-box">
+                        <strong>Detected Objects:</strong> ${renderDetectedObjects(data.detected_objects)}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPlateNumbers(plateNumbers) {
+            if (!plateNumbers || plateNumbers.length === 0) {
+                return "No plate number found";
+            }
+            return plateNumbers.join(", ");
+        }
+
+        function renderDetectedObjects(detectedObjects) {
+            if (!detectedObjects || detectedObjects.length === 0) {
+                return "No objects found";
+            }
+            return detectedObjects.join(", ");
+        }
+    </script>
+</body>
+</html>

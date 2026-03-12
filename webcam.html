@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webcam Detection</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <main class="page-shell">
+        <header class="page-header">
+            <span class="eyebrow">Live Monitoring</span>
+            <h1>Webcam Detection</h1>
+            <p class="page-intro">Open the live stream when you want continuous boxed detections on a rider feed. The layout stays blue and minimal, with the stream given more space.</p>
+        </header>
+
+        <section class="grid">
+            <div class="card card-primary">
+                <h2>Live Stream</h2>
+                <p>Start the webcam to render real-time object annotations directly in the page.</p>
+                <div class="stream-panel">
+                    <div class="button-row">
+                        <button onclick="startWebcam()">Start Webcam</button>
+                        <button class="danger" onclick="stopWebcam()">Stop Webcam</button>
+                        <button onclick="window.location.href='/'">Back</button>
+                    </div>
+                    <p id="webcamStatus">Click "Start Webcam" to begin detection.</p>
+                    <div id="webcamContainer"></div>
+                </div>
+            </div>
+
+            <aside class="card card-secondary">
+                <h2>Live Tips</h2>
+                <p>A stable camera angle gives better rider boxes and cleaner helmet decisions.</p>
+                <div class="quick-links">
+                    <div class="quick-link">
+                        <strong>Face the rider</strong>
+                        <span>Keep the rider head and upper torso visible so the detection box is tighter.</span>
+                    </div>
+                    <div class="quick-link">
+                        <strong>Reduce clutter</strong>
+                        <span>Cleaner backgrounds help the live stream stay readable while annotations update.</span>
+                    </div>
+                </div>
+            </aside>
+        </section>
+    </main>
+
+    <script>
+        let webcamRunning = false;
+
+        function startWebcam() {
+            if (webcamRunning) {
+                return;
+            }
+
+            document.getElementById("webcamContainer").innerHTML = `
+                <img id="webcamStream" src="/webcam?t=${Date.now()}" alt="Webcam stream">
+            `;
+            document.getElementById("webcamStatus").textContent = "Webcam is running.";
+            webcamRunning = true;
+        }
+
+        function stopWebcam() {
+            const container = document.getElementById("webcamContainer");
+            container.innerHTML = "";
+            document.getElementById("webcamStatus").textContent = "Webcam stopped.";
+            webcamRunning = false;
+        }
+    </script>
+</body>
+</html>
